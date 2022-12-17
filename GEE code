@@ -1,0 +1,213 @@
+// Define a Polygon object.
+var polygon = ee.Geometry.Polygon(
+    [[[73.393569, 33.659383],
+      [73.384694, 33.661351],
+      [73.383522, 33.660623],
+      [73.380984, 33.660574],
+      [73.376924, 33.659139],
+      [73.375569, 33.658225],
+      [73.375275, 33.659185],
+      [73.374458, 33.658688],
+      [73.369600, 33.658287],
+      [73.368559, 33.653864],
+      [73.368546, 33.652275],
+      [73.368042, 33.650022],
+      [73.367986, 33.648832],
+      [73.370205, 33.649609],
+      [73.370601, 33.650278],
+      [73.373957, 33.649403],
+      [73.375298, 33.649529],
+      [73.376547, 33.645811],
+      [73.379243, 33.645544],
+      [73.379898, 33.645298],
+      [73.380495, 33.644003],
+      [73.381702, 33.642400],
+      [73.382661, 33.642430],
+      [73.382732, 33.643780],
+      [73.384380, 33.647222],
+      [73.386612, 33.648572],
+      [73.390418, 33.649457],
+      [73.392329, 33.650895],
+      [73.392878, 33.651514],
+      [73.393848, 33.651837],
+      [73.394421, 33.652418],
+      [73.391725, 33.654769],
+      [73.393594, 33.659391]]]);
+
+// Apply the coordinates method to the Polygon object.
+var polygonCoordinates = polygon.coordinates();
+
+// Print the result to the console.
+print('polygon.coordinates(...) =', polygonCoordinates);
+
+// Display relevant geometries on the map.
+Map.setCenter(73.381615, 33.653263, 15); // (Lon, lat, zoom)
+Map.addLayer(polygon,
+             {'color': 'black'},
+             'Geometry [black]: polygon');
+
+// Load Sentinel-1 C-band SAR Ground Range collection (log scale, VV, descending)
+var collectionVV = ee.ImageCollection('COPERNICUS/S1_GRD')
+.filter(ee.Filter.eq('instrumentMode', 'IW'))
+.filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+.filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+.filterMetadata('resolution_meters', 'equals' , 10)
+.filterBounds(roi)
+.select('VV');
+print(collectionVV, 'Collection VV'); 
+
+// Load Sentinel-1 C-band SAR Ground Range collection (log scale, VH, descending)
+var collectionVH = ee.ImageCollection('COPERNICUS/S1_GRD')
+.filter(ee.Filter.eq('instrumentMode', 'IW'))
+.filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+.filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+.filterMetadata('resolution_meters', 'equals' , 10)
+.filterBounds(roi)
+.select('VH');
+print(collectionVH, 'Collection VH');
+
+//Filter by date
+var SARVV = collectionVV.filterDate('2019-08-01', '2019-08-10').mosaic();
+var SARVH = collectionVH.filterDate('2019-08-01', '2019-08-10').mosaic();
+
+// Add the SAR images to "layers" in order to display them
+Map.centerObject(roi, 7);
+Map.addLayer(SARVV, {min:-15,max:0}, 'SAR VV', 0);
+Map.addLayer(SARVH, {min:-25,max:0}, 'SAR VH', 0);
+
+// Function to cloud mask from the pixel_qa band of Landsat 8 SR data.
+function maskL8sr(image) {
+// Bits 3 and 5 are cloud shadows and clouds, respectively.
+var cloudShadowBitMask = 1 << 3;
+var cloudsBitMask = 1 << 5;
+// Get the pixel QA band.
+var qa = image.select('pixel_qa');
+// Both flags should be set to zero, indicating clear conditions.
+var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+.and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+// Return the masked image, scaled to reflectance, without the QA bands.
+ return image.updateMask(mask).divide(10000)
+.select("B[0-9]*")
+.copyProperties(image, ["system:time_start"]);
+}
+
+// Extract the images from the Landsat8 collection
+var collectionl8 = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+.filterDate('2019-08-01', '2019-08-10')
+.filterBounds(roi)
+.map(maskL8sr);
+print(collectionl8, 'Landsat');
+
+//Calculate NDVI and create an image that contains all Landsat 8 bands and NDVI
+var comp = collectionl8.mean();
+var ndvi = comp.normalizedDifference(['B5', 'B4']).rename('NDVI');
+var composite = ee.Image.cat(comp,ndvi);
+
+// Add images to layers in order to display them
+Map.centerObject(roi, 7);
+Map.addLayer(composite, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.2}, 'Optical');
+
+//Apply filter to reduce speckle
+var SMOOTHING_RADIUS = 50;
+var SARVV_filtered = SARVV.focal_mean(SMOOTHING_RADIUS, 'circle', 'meters');
+var SARVH_filtered = SARVH.focal_mean(SMOOTHING_RADIUS, 'circle', 'meters');
+
+//Display the SAR filtered images
+Map.addLayer(SARVV_filtered, {min:-15,max:0}, 'SAR VV Filtered',0);
+Map.addLayer(SARVH_filtered, {min:-25,max:0}, 'SAR VH Filtered',0);
+
+//Merge Feature Collections
+var newfc = open_water.merge(bare_fields).merge(vegetation1).merge(vegetation2).merge(vegetation3).merge(vegetation4).merge(forest);
+
+//Define the SAR bands to train your data
+var final = ee.Image.cat(SARVV_filtered,SARVH_filtered);
+var bands = ['VH','VV'];
+var training = final.select(bands).sampleRegions({
+  collection: newfc,
+  properties: ['landcover'],
+  scale: 30 });
+  
+//Train the classifier
+var classifier = ee.Classifier.smileCart().train({
+  features: training,
+  classProperty: 'landcover',
+  inputProperties: bands
+});
+
+//Run the Classification
+var classified = final.select(bands).classify(classifier);
+
+//Display the Classification
+Map.addLayer(classified, 
+{min: 1, max: 7, palette: ['1667fa', 'c9270d', 'cf7b68', 'ee9a1c', '146d0e', '04bd23', '37fe05']},
+'SAR Classification');
+
+// Create a confusion matrix representing resubstitution accuracy.
+print('RF- SAR error matrix: ', classifier.confusionMatrix());
+print('RF- SAR accuracy: ', classifier.confusionMatrix().accuracy());
+
+//Repeat for Landsat
+//Define the Landsat bands to train your data
+var bandsl8 = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7','NDVI' ];
+var trainingl8 = composite.select(bandsl8).sampleRegions({
+  collection: newfc,
+  properties: ['landcover'],
+  scale: 30
+});
+
+//Train the classifier
+var classifierl8 = ee.Classifier.smileCart().train({
+  features: trainingl8,
+  classProperty: 'landcover',
+  inputProperties: bandsl8
+});
+
+//Run the Classification
+var classifiedl8 = composite.select(bandsl8).classify(classifierl8);
+
+//Display the Classification
+Map.addLayer(classifiedl8, 
+{min: 1, max: 7, palette: ['1667fa', 'c9270d', 'cf7b68', 'ee9a1c', '146d0e', '04bd23', '37fe05']},
+'Optical Classification');
+
+// Create a confusion matrix representing resubstitution accuracy.
+print('RF-L8 error matrix: ', classifierl8.confusionMatrix());
+print('RF-L8 accuracy: ', classifierl8.confusionMatrix().accuracy());
+
+//Define both optical and SAR to train your data
+var opt_sar = ee.Image.cat(composite, SARVV_filtered,SARVH_filtered);
+var bands_opt_sar = ['VH','VV','B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7','NDVI'];
+var training_opt_sar = opt_sar.select(bands_opt_sar).sampleRegions({
+  collection: newfc,
+  properties: ['landcover'],
+  scale: 30 });
+
+//Train the classifier
+var classifier_opt_sar = ee.Classifier.smileCart().train({
+  features: training_opt_sar, 
+  classProperty: 'landcover',
+  inputProperties: bands_opt_sar 
+});
+
+//Run the Classification
+var classifiedboth = opt_sar.select(bands_opt_sar).classify(classifier_opt_sar);
+
+//Display the Classification
+var mask_o = composite.select(0).neq(1000)
+var mask_r = SARVV_filtered.neq(1000)
+var mask = mask_r.updateMask(mask_o)
+Map.addLayer(classifiedboth.updateMask(mask), 
+{min: 1, max: 7, palette: ['1667fa', 'c9270d', 'cf7b68', 'ee9a1c', '146d0e', '04bd23', '37fe05']},
+'Optical/SAR Classification');
+
+// Create a confusion matrix representing resubstitution accuracy.
+print('RF-Opt/SAR error matrix: ', classifier_opt_sar.confusionMatrix());
+print('RF-Opt/SAR accuracy: ', classifier_opt_sar.confusionMatrix().accuracy());
+
+// Export the image, specifying scale and region.
+ Export.image.toDrive({
+   image: classifiedboth,
+  description: 'Optical_Radar',
+   scale: 100,
+    fileFormat: 'GeoTIFF',
+ });
